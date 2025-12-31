@@ -1,12 +1,13 @@
 # main.py – RAW PRICE VERSION with STOCKS + FUTURES support + SIP streaming
 
-import os
-import requests
 import asyncio
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+import os
+
+import httpx
 from alpaca.data.live import StockDataStream
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
 # Load environment variables from .env next to this file
@@ -104,9 +105,6 @@ def read_root():
 # /bars endpoint – auto-detect STOCKS vs FUTURES
 # ---------------------------------------------------------------------------
 
-import httpx
-from fastapi import Query
-
 @app.get("/bars")
 async def get_bars(
     symbol: str,
@@ -153,13 +151,15 @@ async def get_bars(
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, headers=headers, params=params)
-            r.raise_for_status()
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Alpaca error: {e}")
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=500, detail=f"Alpaca request failed: {exc}")
 
     # We do NOT touch or rescale anything here.
-    return r.json()
+    return response.json()
 
 # ---------------------------------------------------------------------------
 # /last_quote endpoint – latest SIP trade from websocket
