@@ -2,5 +2,4 @@ fastapi
 uvicorn[standard]
 requests
 python-dotenv
-alpaca-py
-httpx
+websockets
