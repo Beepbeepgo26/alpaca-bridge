@@ -1,214 +1,181 @@
 import os
-import json
-import asyncio
-from datetime import datetime, timezone
+import threading
+from typing import Dict, Any, Optional, List
 
-import httpx
-import websockets
+import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 
-# ------------------------------------------------------------
-# Load .env locally (Render env vars will override automatically)
-# ------------------------------------------------------------
-load_dotenv()
+# Alpaca websocket (alpaca-py)
+from alpaca.data.live import StockDataStream
+from alpaca.data.enums import DataFeed
 
-# ------------------------------------------------------------
-# ENV VARS (accept a couple common key name variants)
-# ------------------------------------------------------------
-ALPACA_KEY = os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID")
-ALPACA_SECRET = os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
 
-# IMPORTANT: Base should be https://data.alpaca.markets (no /v2)
-ALPACA_BASE_URL = (os.getenv("ALPACA_BASE_URL") or "https://data.alpaca.markets").rstrip("/")
-ALPACA_DATA_FEED = (os.getenv("ALPACA_DATA_FEED") or "iex").lower()
-
-# SIP websocket
-SIP_WS_URL = os.getenv("SIP_WS_URL") or "wss://stream.data.alpaca.markets/v2/sip"
-SIP_SYMBOLS = os.getenv("SIP_SYMBOLS") or "SPY"
-SIP_SYMBOL_LIST = [s.strip().upper() for s in SIP_SYMBOLS.split(",") if s.strip()]
-
-# ------------------------------------------------------------
-# FastAPI
-# ------------------------------------------------------------
 app = FastAPI(
     title="Alpaca Bridge API",
-    description="Bridge between Alpaca Market Data (REST bars + SIP websocket) and GPT Actions.",
+    description="Bridge between Alpaca market data and GPT Actions (REST bars + SIP websocket cache).",
     version="2.0.0",
 )
 
+# Allow GPT Actions to call this from anywhere
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # OK for prototype; restrict later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------
-# In-memory store for latest SIP ticks (trades + quotes)
-# latest[symbol] = { ... }
-# ------------------------------------------------------------
-latest = {}
-latest_lock = asyncio.Lock()
-sip_task = None
+# ---- ENV HELPERS ----
+
+def getenv_any(*names: str, default: Optional[str] = None) -> Optional[str]:
+    """Try multiple env var names (helps when you accidentally used ALPACA_* vs APCA_*)."""
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return v
+    return default
 
 
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
+APCA_KEY = getenv_any("APCA_API_KEY_ID", "ALPACA_API_KEY_ID")
+APCA_SECRET = getenv_any("APCA_API_SECRET_KEY", "ALPACA_API_SECRET_KEY")
+
+# IMPORTANT: this should be https://data.alpaca.markets (no /v2)
+APCA_BASE_URL = getenv_any("APCA_BASE_URL", "ALPACA_BASE_URL", default="https://data.alpaca.markets").rstrip("/")
+
+ALPACA_DATA_FEED = getenv_any("ALPACA_DATA_FEED", default="sip").lower()
+SIP_SYMBOLS = getenv_any("SIP_SYMBOLS", default="SPY")
+
+# ---- IN-MEMORY CACHE FROM WEBSOCKET ----
+latest_trades: Dict[str, Dict[str, Any]] = {}
+latest_trades_lock = threading.Lock()
 
 
-async def sip_stream_loop():
-    """
-    Connects to Alpaca SIP websocket and keeps latest trades/quotes in memory.
-    Reconnects forever if connection drops.
-    """
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        print("[SIP] Missing ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY. SIP stream will not start.")
+def _alpaca_headers() -> Dict[str, str]:
+    if not APCA_KEY or not APCA_SECRET:
+        raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY env vars.")
+    return {
+        "APCA-API-KEY-ID": APCA_KEY,
+        "APCA-API-SECRET-KEY": APCA_SECRET,
+    }
+
+
+def _feed_enum(feed: str) -> DataFeed:
+    # alpaca-py uses DataFeed enum
+    if feed.lower() == "sip":
+        return DataFeed.SIP
+    return DataFeed.IEX
+
+
+def start_sip_stream_thread() -> None:
+    """Start Alpaca websocket stream in a background thread so FastAPI isn't blocked."""
+    if not APCA_KEY or not APCA_SECRET:
+        print("[stream] Keys not set; websocket stream will NOT start.")
         return
 
-    symbols = SIP_SYMBOL_LIST or ["SPY"]
+    symbols: List[str] = [s.strip().upper() for s in (SIP_SYMBOLS or "SPY").split(",") if s.strip()]
+    feed = _feed_enum(ALPACA_DATA_FEED)
 
-    while True:
+    def run_stream() -> None:
         try:
-            print(f"[SIP] Connecting to {SIP_WS_URL} symbols={symbols} ...")
+            stream = StockDataStream(APCA_KEY, APCA_SECRET, feed=feed)
 
-            async with websockets.connect(SIP_WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                # 1) auth
-                await ws.send(json.dumps({
-                    "action": "auth",
-                    "key": ALPACA_KEY,
-                    "secret": ALPACA_SECRET
-                }))
+            async def on_trade(trade) -> None:
+                sym = str(trade.symbol).upper()
+                payload = {
+                    "symbol": sym,
+                    "price": float(trade.price),
+                    "size": int(getattr(trade, "size", 0) or 0),
+                    "timestamp": str(trade.timestamp),
+                    "feed": ALPACA_DATA_FEED,
+                }
+                with latest_trades_lock:
+                    latest_trades[sym] = payload
 
-                auth_msg = await ws.recv()
-                print("[SIP] Auth response:", auth_msg)
+            for sym in symbols:
+                stream.subscribe_trades(on_trade, sym)
 
-                # 2) subscribe (trades + quotes)
-                await ws.send(json.dumps({
-                    "action": "subscribe",
-                    "trades": symbols,
-                    "quotes": symbols
-                }))
-
-                sub_msg = await ws.recv()
-                print("[SIP] Subscribe response:", sub_msg)
-
-                # 3) read forever
-                async for raw in ws:
-                    try:
-                        data = json.loads(raw)
-                        if not isinstance(data, list):
-                            continue
-
-                        async with latest_lock:
-                            for msg in data:
-                                t = msg.get("T")  # message type
-                                sym = (msg.get("S") or "").upper()
-                                if not sym:
-                                    continue
-
-                                # Trade message example: {"T":"t","S":"SPY","p":680.12,"t":"..."}
-                                if t == "t":
-                                    latest.setdefault(sym, {})
-                                    latest[sym]["last_trade_price"] = msg.get("p")
-                                    latest[sym]["last_trade_time"] = msg.get("t")
-                                    latest[sym]["updated_at"] = _now_iso()
-
-                                # Quote message example: {"T":"q","S":"SPY","bp":..,"ap":..,"t":"..."}
-                                elif t == "q":
-                                    latest.setdefault(sym, {})
-                                    latest[sym]["bid_price"] = msg.get("bp")
-                                    latest[sym]["ask_price"] = msg.get("ap")
-                                    latest[sym]["quote_time"] = msg.get("t")
-                                    latest[sym]["updated_at"] = _now_iso()
-
-                    except Exception:
-                        # ignore malformed message
-                        pass
-
+            print(f"[stream] Starting websocket stream. feed={ALPACA_DATA_FEED} symbols={symbols}")
+            stream.run()
         except Exception as e:
-            print(f"[SIP] Disconnected/error: {e}. Reconnecting in 3s...")
-            await asyncio.sleep(3)
+            print(f"[stream] Websocket stream crashed: {e}")
+
+    t = threading.Thread(target=run_stream, daemon=True)
+    t.start()
 
 
 @app.on_event("startup")
-async def _startup():
-    global sip_task
-    # Start SIP background task (non-blocking)
-    sip_task = asyncio.create_task(sip_stream_loop())
+def on_startup() -> None:
+    # Start websocket stream on boot
+    start_sip_stream_thread()
 
 
-# ------------------------------------------------------------
-# Endpoints
-# ------------------------------------------------------------
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "message": "Alpaca Bridge is live (REST bars + SIP websocket).",
-        "have_keys": bool(ALPACA_KEY and ALPACA_SECRET),
-        "rest_feed": ALPACA_DATA_FEED,
-        "sip_symbols": SIP_SYMBOL_LIST,
-        "sip_ws_url": SIP_WS_URL,
-    }
-
+# ---- ROUTES ----
 
 @app.get("/health")
-def health():
-    return root()
-
-
-@app.get("/latest")
-async def get_latest(symbol: str = Query("SPY")):
-    sym = symbol.upper()
-    async with latest_lock:
-        out = latest.get(sym)
-
+def health() -> Dict[str, Any]:
     return {
-        "symbol": sym,
-        "latest": out,
-        "note": "If latest is null, SIP stream is not running or no messages received yet."
+        "status": "ok",
+        "base_url": APCA_BASE_URL,
+        "feed": ALPACA_DATA_FEED,
+        "sip_symbols": SIP_SYMBOLS,
+        "keys_present": bool(APCA_KEY and APCA_SECRET),
     }
+
+
+@app.get("/latest_trade")
+def latest_trade(symbol: str = Query("SPY")) -> Dict[str, Any]:
+    """Return latest trade from websocket cache if present; otherwise fallback to REST latest trade."""
+    sym = symbol.upper()
+
+    with latest_trades_lock:
+        cached = latest_trades.get(sym)
+
+    if cached:
+        return {"source": "websocket_cache", **cached}
+
+    # Fallback to REST
+    try:
+        url = f"{APCA_BASE_URL}/v2/stocks/{sym}/trades/latest"
+        params = {"feed": ALPACA_DATA_FEED}
+        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=10)
+        if not r.ok:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return {"source": "rest_latest_trade", **r.json()}
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/bars")
-async def get_bars(
-    symbol: str = Query(..., description="Stock/ETF symbol, e.g. SPY"),
-    timeframe: str = Query("5Min", description="Examples: 1Min, 5Min, 15Min, 1Hour, 1Day"),
-    limit: int = Query(50, ge=1, le=10000),
-):
+def get_bars(
+    symbol: str = Query("SPY"),
+    timeframe: str = Query("5Min"),  # examples: 1Min, 5Min, 15Min, 1Hour, 1Day
+    limit: int = Query(20, ge=1, le=1000),
+) -> Dict[str, Any]:
     """
-    Returns RAW bars from Alpaca REST.
-    Supports BOTH minute bars and daily bars by choosing timeframe (e.g. 5Min vs 1Day).
-    Uses ALPACA_DATA_FEED (sip/iex) automatically.
+    OHLCV bars from Alpaca REST API.
+    You do NOT enter params manually anywhere — GPT calls /bars with query params.
     """
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        raise HTTPException(status_code=500, detail="Missing Alpaca API keys in environment variables.")
-
     sym = symbol.upper()
-
-    url = f"{ALPACA_BASE_URL}/v2/stocks/{sym}/bars"
-
-    headers = {
-        "APCA-API-KEY-ID": ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-    }
-
-    # THIS is where params go — in code — not Render.
-    params = {
-        "timeframe": timeframe,
-        "limit": limit,
-        "feed": ALPACA_DATA_FEED,   # sip or iex
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, headers=headers, params=params)
-            r.raise_for_status()
-            return r.json()
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-    except Exception as e:
+        url = f"{APCA_BASE_URL}/v2/stocks/{sym}/bars"
+        params = {
+            "timeframe": timeframe,
+            "limit": limit,
+            "feed": ALPACA_DATA_FEED,  # sip vs iex
+        }
+        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=10)
+        if not r.ok:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/daily")
+def get_daily(
+    symbol: str = Query("SPY"),
+    limit: int = Query(50, ge=1, le=1000),
+) -> Dict[str, Any]:
+    """Convenience endpoint for daily bars."""
+    return get_bars(symbol=symbol, timeframe="1Day", limit=limit)
